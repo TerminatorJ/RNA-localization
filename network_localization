@@ -1,0 +1,341 @@
+import sys
+import h5py
+import numpy as np
+import gin
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torch.utils.data import TensorDataset
+import torch.nn.functional as F
+from pytorch_lightning import Trainer
+import pytorch_lightning as pl
+from torchsummary import summary
+# %%
+from layers import base
+from layers import embedding
+# Conv1DFirstLayer, Conv1DResBlock, IndexEmbeddingOutputHead, LinearProjection
+
+# %%
+#####################################
+#########Adapted network#############
+#####################################
+@gin.configurable()
+class MultiRBPNet_adp(nn.Module):
+    def __init__(self, n_tasks, n_layers=9, n_body_filters=256, seqDim = 8000):
+        super(MultiRBPNet_adp, self).__init__()
+        self.n_tasks = n_tasks
+        self.seqDim = seqDim
+        self.n_body_filters = n_body_filters
+        self.body = nn.Sequential(*[base.Conv1DFirstLayer(4, n_body_filters, 6)]+[(base.Conv1DResBlock(n_body_filters, n_body_filters, dilation=(2**i))) for i in range(n_layers)])
+        self.linear_projection = base.LinearProjection(in_features=n_body_filters)
+        self.head = embedding.IndexEmbeddingOutputHead(self.n_tasks, dims=n_body_filters)
+        self.fc1 = nn.Linear(n_body_filters, 128)
+        self.fc2 = nn.Linear(128, 7)
+        self.GlobalMeanPool = nn.AvgPool1d(seqDim)
+
+    def forward(self, inputs, **kwargs):
+        x = inputs.view(-1, 4, self.seqDim)
+        for layer in self.body:
+            x = layer(x)
+
+        x = torch.transpose(x, dim0=-2, dim1=-1)
+        x = self.linear_projection(x)
+        x = torch.transpose(x, dim0=-2, dim1=-1)
+
+        return x
+
+#####################################
+#########added network###############
+#####################################
+@gin.configurable()
+class customized(nn.Module):
+    def __init__(self):
+        super(customized, self).__init__()
+        saved_model = MultiRBPNet(n_tasks = 7, n_layers=9, n_body_filters=256)
+        self.saved_model = saved_model.to(device = device)
+       
+        self.fc1 = nn.Linear(256, 128)
+        self.fc2 = nn.Linear(128, 7)
+        self.GlobalMeanPool = nn.AvgPool1d(8000)
+
+
+#test
+
+
+    def forward(self, inputs, **kwargs):
+        x = inputs.view(-1, 4, 8000)
+        for layer in list(self.saved_model.children())[:-2]:
+            x = layer(x)
+        print("initial model has been loaded", x.shape)
+        # print()
+        # x = torch.transpose(x, dim0=-2, dim1=-1)
+
+        x = self.GlobalMeanPool(x)
+        x = x.view(-1,256)
+
+
+        #without embedding
+        x = F.relu(self.fc1(x))
+        x = torch.sigmoid(self.fc2(x))
+        out = x
+        return out
+
+
+
+
+#####################################
+#########Original network############
+#####################################
+
+@gin.configurable()
+class MultiRBPNet(nn.Module):
+    def __init__(self, n_tasks, n_layers=9, n_body_filters=256):
+        super(MultiRBPNet, self).__init__()
+
+        self.n_tasks = n_tasks
+        self.n_body_filters = n_body_filters
+
+        self.body = nn.Sequential(*[base.Conv1DFirstLayer(4, n_body_filters, 6)]+[(base.Conv1DResBlock(n_body_filters, n_body_filters, dilation=(2**i))) for i in range(n_layers)])
+        # self.body = nn.Sequential(*[base.Conv1DFirstLayer(4, n_body_filters, 6)]+[(base.Conv1DResBlock(n_body_filters, n_body_filters, dilation=(2**i))) for i in range(n_layers)])
+        self.linear_pj = base.LinearProjection(in_features=n_body_filters)
+        # self.head = embedding.IndexEmbeddingOutputHead(self.n_tasks, dims=n_body_filters)
+
+    
+    def forward(self, inputs, **kwargs):
+        x = inputs
+        for layer in self.body:
+            x = layer(x)
+        # transpose: # (batch_size, dim, N) --> (batch_size, N, dim)
+        # x = torch.transpose(x, dim0=-2, dim1=-1)
+        x = self.linear_pj(x)
+
+        return x
+
+####################################
+########Model for training##########
+####################################
+
+class myModel(pl.LightningModule):
+    def __init__(self, network, optimizer):
+        super(myModel, self).__init__()
+        self.network = network
+        self.loss_fn = nn.BCELoss()
+        self.optimizer_cls = optimizer
+    
+    def forward(self, *args, **kwargs):
+        return self.network(*args, **kwargs)
+    
+    def configure_optimizers(self):
+        optimizer = self.optimizer_cls(self.parameters(), lr = 1e-3)
+        return optimizer
+
+
+    def training_step(self, batch, batch_idx, **kwargs):
+        x, y = batch
+        y_pred = self.forward(x)
+        # print("before transfer:", y_pred.dtype)
+        thred = 0.5
+        y_pred = (y_pred > thred).type(torch.int)
+        y_pred = y_pred.float()
+        # print("after transfer:", y_pred.dtype)
+        loss = self.loss_fn(y, y_pred)
+        loss.requires_grad = True
+        self.log("train_loss", loss, on_epoch = True)
+        return loss
+    def validation_step(self, val_batch, batch_idx):
+        x, y = val_batch
+        y_pred = self.forward(x)
+        # print("***********:", y_pred)
+        thred = 0.5
+        y_pred = (y_pred > thred).type(torch.int)
+
+        y_pred = y_pred.float()
+        # print("***********:", y_pred.dtype)
+        # print("***********:", y_pred)
+        loss = self.loss_fn(y, y_pred)
+        return self.log("val_loss", loss)
+
+    
+
+
+
+    
+
+
+if __name__ == "__main__":
+
+    device = "cuda" if torch.cuda.is_available else "cpu"
+
+    #loading the modified model
+    # model = MultiRBPNet_adp(n_tasks = 7, n_layers=9, n_body_filters=256, seqDim = 8000)
+    # model = model.to(device = device)
+    # input = torch.ones(1, 4, 8000, device = "cuda")
+    # model(input)
+    # # print(model)
+    # summary(model, input_size = (4, 8000), batch_size = 0, device = device)
+
+
+
+
+
+    #loading the original model
+    model = MultiRBPNet(n_tasks = 7, n_layers=9, n_body_filters=256)
+    model = model.to(device = device)
+    # summary(model, input_size = (4, 8000), batch_size = 0, device = device)
+    ##add layers
+    for param in model.parameters():
+        param.requires_grad = False
+
+    
+    model = model.to(device = device)
+    summary(model, input_size = (4, 8000), batch_size = 0, device = device)
+    # print(list(model_adp.parameters())[1])
+
+
+
+
+    
+
+    # #check the parameters of the model
+    # summary(model, input_size = (4, 8000), batch_size = 0, device = device)
+
+
+    #loading the checkpoint
+    ck_point = torch.load("/binf-isilon/winthergrp/jwang/panRBPnet/checkpoint/epoch=21-step=61160.ckpt")
+    # print(ck_point.keys())
+    # print(ck_point['state_dict'])
+    #modify the ck_point
+    for key in list(ck_point["state_dict"].keys()):
+        ck_point["state_dict"][key.replace("network.", "")] = ck_point["state_dict"].pop(key)
+    # print(list(model.state_dict().keys())[:])
+    # print(list(ck_point['state_dict'].keys())[:])
+    # print(model.state_dict()["body.1.conv1d.weight"].shape)
+    # print(ck_point['state_dict']["body.1.conv1d.weight"].shape)
+    # print("initial model")
+    # print(model.state_dict()["body.6.batch_norm.running_mean"])
+    model.load_state_dict(ck_point['state_dict'], strict=False)
+
+    # print(ck_point['state_dict'])
+    # print(model_adp.state_dict())
+    # print(ck_point['state_dict'])
+    # print(model.state_dict()["body.6.batch_norm.running_mean"])
+    # print(ck_point['state_dict']["body.6.batch_norm.running_mean"])
+    # model.state_dict()[]
+    #0.body.8.batch_norm.num_batches_tracked
+
+
+
+
+    # #freeze the model
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # loading the new model
+
+    new_model = nn.Sequential(
+        model,
+        nn.AvgPool1d(8000),
+        nn.Flatten(),
+        nn.Linear(256,128),
+        nn.ReLU(),
+        nn.Linear(128,7),
+        nn.Sigmoid()
+    )
+    new_model = new_model.to(device = device)
+    summary(new_model, input_size = (4, 8000), batch_size = 0, device = device)
+
+    #check the frozen parameters
+    # for param in new_model.parameters():
+    #     param.requires_grad = False
+    for param in new_model.parameters():
+        print(param.requires_grad)
+
+   
+
+    print("loading the data")
+    X_train = h5py.File("/binf-isilon/winthergrp/jwang/rbpnet/data/train_test_val/Train80_4dim.h5", "r")
+    X_test = h5py.File("/binf-isilon/winthergrp/jwang/rbpnet/data/train_test_val/Test80_4dim.h5", "r")
+    X_val = h5py.File("/binf-isilon/winthergrp/jwang/rbpnet/data/train_test_val/Val80_4dim.h5", "r")
+
+    y_train = h5py.File("/binf-isilon/winthergrp/jwang/rbpnet/data/train_test_val/Train80_label_4dim.h5", "r")
+    y_test = h5py.File("/binf-isilon/winthergrp/jwang/rbpnet/data/train_test_val/Test80_label_4dim.h5", "r")
+    y_val = h5py.File("/binf-isilon/winthergrp/jwang/rbpnet/data/train_test_val/Val80_label_4dim.h5", "r")
+
+    mode = "test"
+
+    if mode == "test":
+        X_train = np.array(X_train["sequence_encoded"])[:100]
+        y_train = np.array(y_train["sequence_encoded"])[:100]
+
+        X_val = np.array(X_val["sequence_encoded"])[:50]
+        y_val = np.array(y_val["sequence_encoded"])[:50]
+    else:
+        X_train = np.array(X_train["sequence_encoded"])
+        y_train = np.array(y_train["sequence_encoded"])
+
+        X_val = np.array(X_val["sequence_encoded"])
+        y_val = np.array(y_val["sequence_encoded"])
+    print(X_train.shape)
+    print(y_train.shape)
+    print(type(X_train))
+    X_train = torch.from_numpy(X_train).to(device, torch.float)
+    y_train = torch.from_numpy(y_train).to(device, torch.float)
+    X_val = torch.from_numpy(X_val).to(device, torch.float)
+    y_val = torch.from_numpy(y_val).to(device, torch.float)
+
+    train_dataset = torch.utils.data.TensorDataset(X_train, y_train)
+    val_dataset = torch.utils.data.TensorDataset(X_val, y_val)
+
+    #using dataloader to load the data
+    dataloader_train = torch.utils.data.DataLoader(train_dataset, batch_size = 4, shuffle = True)
+    dataloader_val = torch.utils.data.DataLoader(val_dataset, batch_size = 4, shuffle = True)
+
+    # print(next(iter(dataloader_train)))
+
+
+    trainer = Trainer(max_epochs = 10, gpus = 1)
+
+    #train the model
+    loss_fn = nn.BCELoss()
+    optimizer = torch.optim.SGD
+    plain_model = myModel(new_model, optimizer)
+
+
+    #training the model
+    trainer.fit(plain_model, train_dataloaders = dataloader_train, val_dataloaders = dataloader_val)
+
+    #saving the model
+    torch.save(plain_model.state_dict(), "../../Outputs/plain_model_weights.pth")
+
+    #independent test
+
+    
+'''
+'''
+
+
+
+
+
+
+    
+    
+
+    
+    
+    
+    #
+
+  #Additional scripts    
+'''
+        #Average pooling by globalAvgPool
+        x = self.GlobalMeanPool(x)
+        x = x.view(-1,self.n_body_filters)
+
+
+        #without embedding
+        x = F.relu(self.fc1(x))
+        x = torch.sigmoid(self.fc2(x))
+        out = x
+        return out
+'''  
