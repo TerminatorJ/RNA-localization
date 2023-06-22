@@ -13,6 +13,5 @@ install the Viennarna to get the RNA structure information
 
 ```linux
 conda install -c bioconda viennarna
-
 ```
 
