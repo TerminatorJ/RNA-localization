@@ -11,8 +11,8 @@ booster is the main control scripts of the model, where you can control whether 
 
 install the Viennarna to get the RNA structure information
 
-‘’‘linux
+```linux
 conda install -c bioconda viennarna
 
-'''
+```
 
